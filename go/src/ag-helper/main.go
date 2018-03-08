@@ -524,7 +524,7 @@ func promote(
 			stdout.Printf("Availability mode of %s on this node is SYNCHRONOUS_COMMIT.\n", agName)
 		} else {
 			return mssqlcommon.OCF_ERR_GENERIC, fmt.Errorf(
-				"Local replica has availabilty mode %s (%d), so it cannot be promoted to PRIMARY",
+				"Local replica has availability mode %s (%d), so it cannot be promoted to PRIMARY",
 				availabilityModeDesc, availabilityMode)
 		}
 	}
@@ -599,7 +599,7 @@ func promote(
 	if numSequenceNumbers < requiredNumSequenceNumbers {
 		return mssqlcommon.OCF_ERR_GENERIC, fmt.Errorf(
 			"Expected to receive %d sequence numbers but only received %d. Not enough replicas are online to safely promote the local replica.",
-			numSequenceNumbers, requiredNumSequenceNumbers)
+			requiredNumSequenceNumbers, numSequenceNumbers)
 	}
 
 	stdout.Printf("Changing role of %s on this node to primary...\n", agName)
