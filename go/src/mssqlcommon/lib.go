@@ -313,6 +313,7 @@ func OpenDBWithHealthCheck(
 
 	go func() {
 		var db *sql.DB
+		var err error
 
 		for i := uint(1); ; i++ {
 			stdout.Printf("Attempt %d to connect to the instance at %s:%d and run sp_server_diagnostics\n", i, hostname, port)
@@ -321,7 +322,7 @@ func OpenDBWithHealthCheck(
 				_ = db.Close()
 			}
 
-			db, err := openDBWithHealthCheckInner(hostname, port, username, password, applicationName, connectionTimeout)
+			db, err = OpenDB(hostname, port, username, password, applicationName, connectionTimeout)
 			if err == nil {
 				stdout.Printf("Connected to the instance at %s:%d\n", hostname, port)
 				dbChannel <- db
@@ -340,7 +341,13 @@ func OpenDBWithHealthCheck(
 	for {
 		select {
 		case db = <-dbChannel:
-			err = nil
+			var diagnostics Diagnostics
+			diagnostics, err = QueryDiagnostics(db)
+			if err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+			err = Diagnose(diagnostics)
 			return
 
 		case err = <-errChannel:
