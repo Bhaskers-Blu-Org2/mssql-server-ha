@@ -1,0 +1,563 @@
+#!/bin/bash
+
+# Copyright 2017 Microsoft Corporation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# SQL Server Always-On Availability Groups resource agent
+#
+# Valid actions are:
+#    start
+#    stop
+#    promote
+#    demote
+#    monitor
+#    validate-all
+#    meta-data
+#
+
+# ----------------------------------------------------------------------------------------------------------
+# Location of other files used by this resource agent
+#
+: ${AG_HELPER_BIN=${OCF_ROOT}/lib/mssql/ag-helper}
+: ${METADATA_FILE=${OCF_ROOT}/lib/mssql/ag_metadata}
+: ${USAGE_FILE=${OCF_ROOT}/lib/mssql/ag_usage}
+
+# ----------------------------------------------------------------------------------------------------------
+# Defaults values for optional parameters
+#
+: ${MONITOR_LEVEL_DEFAULT=3}
+: ${MONITOR_TIMEOUT_DEFAULT=30}
+: ${MONITORING_CREDENTIALS_FILE_DEFAULT=/var/opt/mssql/secrets/passwd}
+: ${PORT_DEFAULT=1433}
+: ${ONLINE_DATABASES_RETRIES_DEFAULT=60}
+: ${PROCESS_NAME_DEFAULT=sqlservr}
+: ${REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT_DEFAULT=-1} # -1 is a sentinel that ag-helper interprets as "unset"
+
+# ----------------------------------------------------------------------------------------------------------
+# Pacemaker libraries
+#
+: ${OCF_FUNCTIONS=${OCF_ROOT}/resource.d/heartbeat/.ocf-shellfuncs}
+. ${OCF_FUNCTIONS}
+: ${__OCF_ACTION=$1}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_meta_data
+#
+# Description:
+#    Implements the OCF "meta-data" action.
+#
+mssql_meta_data() {
+	cat ${METADATA_FILE}
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: usage
+#
+mssql_usage() {
+	cat ${USAGE_FILE}
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_start
+#
+# Description:
+#    Implements the OCF "start" action.
+#
+mssql_start() {
+	ocf_log info "mssql_start"
+
+	local command_output
+	local rc
+
+	command_output=$(
+		$AG_HELPER_BIN \
+			--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+			--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+			--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+			--action start --required-synchronized-secondaries-to-commit "$OCF_RESKEY_required_synchronized_secondaries_to_commit" 2>&1 |
+			while read -r line; do
+				ocf_log info "start: $line"
+				echo "$line"
+			done
+		exit ${PIPESTATUS[0]}
+	)
+	rc=$?
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	case $rc in
+		$OCF_SUCCESS)
+			# Allow this replica to become a master
+			#
+			crm_master -v 10
+			;;
+		$OCF_RUNNING_MASTER)
+			# This is already a primary. Set its master score higher than other replicas.
+			#
+			crm_master -v 20
+			;;
+	esac
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_stop
+#
+# Description:
+#    Implements the OCF "stop" action.
+#
+mssql_stop() {
+	ocf_log info "mssql_stop"
+
+	local command_output
+	local rc
+
+	command_output=$(
+		$AG_HELPER_BIN \
+			--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+			--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+			--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+			--action stop 2>&1 |
+			while read -r line; do
+				ocf_log info "stop: $line"
+				echo "$line"
+			done
+		exit ${PIPESTATUS[0]}
+	)
+	rc=$?
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_monitor
+#
+# Description:
+#    Implements the OCF "monitor" action.
+#
+mssql_monitor() {
+	ocf_log info "mssql_monitor"
+
+	if (( $OCF_RESKEY_CRM_meta_timeout / 1000 <= $OCF_RESKEY_monitor_timeout )); then
+		ocf_exit_reason "The monitor action should have a higher timeout than the 'monitor_timeout' resource option"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	local command_output
+	local rc
+
+	if ! pidof $OCF_RESKEY_process_name; then
+		ocf_exit_reason "SQL Server isn't running."
+		return $OCF_NOT_RUNNING
+	fi
+
+	command_output=$(
+		$AG_HELPER_BIN \
+			--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+			--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+			--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+			--action monitor --online-databases-retries "$OCF_RESKEY_online_databases_retries" --required-synchronized-secondaries-to-commit "$OCF_RESKEY_required_synchronized_secondaries_to_commit" 2>&1 |
+			while read -r line; do
+				ocf_log info "monitor: $line"
+				echo "$line"
+			done
+		exit ${PIPESTATUS[0]}
+	)
+	rc=$?
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	case $rc in
+		$OCF_SUCCESS)
+			# Allow this replica to become a master.
+			#
+			crm_master -v 10
+			;;
+		$OCF_RUNNING_MASTER)
+			# This is a primary. Set its master score higher than other replicas.
+			#
+			crm_master -v 20
+			;;
+		*)
+			# This replica is not healthy enough to be promoted to a master.
+			crm_master -v 0
+			;;
+	esac
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_promote
+#
+# Description:
+#    Implements the OCF "promote" action.
+#
+mssql_promote() {
+	ocf_log info "mssql_promote"
+
+	# Fetch sequence numbers of all replicas
+	#
+	local sequence_numbers=$(attrd_updater -n "$OCF_RESOURCE_INSTANCE-sequence-number" -QA)
+
+	local command_output
+	local rc
+
+	command_output=$(
+		$AG_HELPER_BIN \
+			--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+			--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+			--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+			--action promote --sequence-numbers "$sequence_numbers" --new-master "$OCF_RESKEY_CRM_meta_notify_promote_uname" \
+			--required-synchronized-secondaries-to-commit "$OCF_RESKEY_required_synchronized_secondaries_to_commit" 2>&1 |
+			while read -r line; do
+				ocf_log info "promote: $line"
+				echo "$line"
+			done
+		exit ${PIPESTATUS[0]}
+	)
+	rc=$?
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_demote
+#
+# Description:
+#    Implements the OCF "demote" action.
+#
+mssql_demote() {
+	ocf_log info "mssql_demote"
+
+	local command_output
+	local rc
+
+	command_output=$(
+		$AG_HELPER_BIN \
+			--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+			--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+			--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+			--action demote --online-databases-retries "$OCF_RESKEY_online_databases_retries" 2>&1 |
+			while read -r line; do
+				ocf_log info "demote: $line"
+				echo "$line"
+			done
+		exit ${PIPESTATUS[0]}
+	)
+	rc=$?
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_notify
+#
+# Description:
+#    Implements the OCF "notify" action.
+#
+mssql_notify() {
+	ocf_log info "mssql_notify $OCF_RESKEY_CRM_meta_notify_type-$OCF_RESKEY_CRM_meta_notify_operation"
+
+	local command_output
+	local rc
+
+	case "$OCF_RESKEY_CRM_meta_notify_type-$OCF_RESKEY_CRM_meta_notify_operation" in
+		'pre-start')
+			command_output=$(
+				$AG_HELPER_BIN \
+					--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+					--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+					--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+					--action pre-start --required-synchronized-secondaries-to-commit "$OCF_RESKEY_required_synchronized_secondaries_to_commit" 2>&1 |
+					while read -r line; do
+						ocf_log info "notify: $line"
+						echo "$line"
+					done
+				exit ${PIPESTATUS[0]}
+			)
+			rc=$?
+			;;
+
+		'post-stop')
+			command_output=$(
+				$AG_HELPER_BIN \
+					--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+					--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+					--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+					--action post-stop --required-synchronized-secondaries-to-commit "$OCF_RESKEY_required_synchronized_secondaries_to_commit" 2>&1 |
+					while read -r line; do
+						ocf_log info "notify: $line"
+						echo "$line"
+					done
+				exit ${PIPESTATUS[0]}
+			)
+			rc=$?
+			;;
+
+		'pre-promote')
+			command_output=$(
+				$AG_HELPER_BIN \
+					--port "$OCF_RESKEY_port" --credentials-file "$OCF_RESKEY_monitoring_credentials_file" --ag-name "$OCF_RESKEY_ag_name" \
+					--application-name "monitor-$OCF_RESOURCE_INSTANCE" \
+					--connection-timeout "$OCF_RESKEY_monitor_timeout" --health-threshold "$OCF_RESKEY_monitor_policy" \
+					--action pre-promote 2>&1 |
+					while read -r line; do
+						ocf_log info "notify: $line"
+						echo "$line"
+					done
+				exit ${PIPESTATUS[0]}
+			)
+			rc=$?
+			;;
+
+		'post-promote')
+			# Reset sequence number attribute so that it doesn't retain old values for subsequent failovers
+			attrd_updater -n "$OCF_RESOURCE_INSTANCE-sequence-number" -D
+			return $OCF_SUCCESS
+			;;
+
+		*)
+			return $OCF_SUCCESS
+			;;
+	esac
+
+	local exit_reason=$(echo "$command_output" | grep -Po '^ERROR: \K.*' | head -n1)
+	if [[ "x$exit_reason" != "x" ]]; then
+		ocf_exit_reason "$exit_reason"
+	fi
+
+	if (($rc < 10)); then
+		# ag-helper failed in an unexpected way
+		#
+		return $OCF_ERR_GENERIC
+	fi
+
+	rc=$(($rc - 10))
+
+	case "$OCF_RESKEY_CRM_meta_notify_type-$OCF_RESKEY_CRM_meta_notify_operation" in
+		'pre-promote')
+			if (($rc == $OCF_SUCCESS)); then
+				# Find sequence number in ag-helper's output
+				#
+				local sequence_number=$(echo "$command_output" | grep -Po '^SEQUENCE_NUMBER: \K.*')
+
+				if [[ "x$sequence_number" = "x" ]]; then
+					ocf_exit_reason "Could not find sequence number in ag-helper output."
+					return $OCF_ERR_GENERIC
+				fi
+
+				attrd_updater -n "$OCF_RESOURCE_INSTANCE-sequence-number" -U "$sequence_number" -p
+
+				# Work around attrd bug https://bugzilla.redhat.com/show_bug.cgi?id=1463033
+				# attrd_updater can receive ack from attrd for the update before attrd has propagated the value to other nodes
+				# or even committed it locally
+				local attribute_value=''
+				while [[ "x$attribute_value" = "x" ]]; do
+					sleep 5
+					attribute_value=$(attrd_updater -n "$OCF_RESOURCE_INSTANCE-sequence-number" -Q)
+				done
+
+				# -Q returns the value when it's committed locally but not necessarily propagated to other nodes,
+				# so sleep some more to let the update propagate
+				sleep 5
+			fi
+			;;
+	esac
+
+	return $rc
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_validate
+#
+# Description:
+#    Implements the OCF "validate-all" action.
+#
+# Returns:
+#    OCF_SUCCESS: The credentials file exists and the ag-helper binary is present.
+#    OCF_ERR_ARGS: The credentials file does not exist.
+#    OCF_ERR_CONFIGURED: The ag-helper binary is not present.
+#
+mssql_validate() {
+	ocf_log info "mssql_validate"
+
+	# Set default parameters
+	#
+	: ${OCF_RESKEY_monitor_policy=$MONITOR_LEVEL_DEFAULT}
+	: ${OCF_RESKEY_monitor_timeout=$MONITOR_TIMEOUT_DEFAULT}
+	: ${OCF_RESKEY_monitoring_credentials_file=$MONITORING_CREDENTIALS_FILE_DEFAULT}
+	: ${OCF_RESKEY_port=$PORT_DEFAULT}
+	: ${OCF_RESKEY_online_databases_retries=$ONLINE_DATABASES_RETRIES_DEFAULT}
+	: ${OCF_RESKEY_process_name=$PROCESS_NAME_DEFAULT}
+	: ${OCF_RESKEY_required_synchronized_secondaries_to_commit:=$OCF_RESKEY_required_copies_to_commit}
+	: ${OCF_RESKEY_required_synchronized_secondaries_to_commit:=$REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT_DEFAULT}
+
+	# Check binaries necessary for the resource agent to run
+	#
+	check_binary $AG_HELPER_BIN
+
+	# Check credentials file
+	#
+	if [[ ! -f "$OCF_RESKEY_monitoring_credentials_file" ]]; then
+		ocf_exit_reason "Expect credentials file at $OCF_RESKEY_monitoring_credentials_file"
+		return $OCF_ERR_ARGS
+	fi
+
+	# Check notify=true
+	if [[ "x$OCF_RESKEY_CRM_meta_notify" != "xtrue" ]]; then
+		ocf_exit_reason "Resource must be configured with notify=true"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	return $OCF_SUCCESS
+}
+
+# ----------------------------------------------------------------------------------------------------------
+# function: mssql_export_ocf_exit_codes
+#
+# Description:
+#    Exports the OCF exit code variables as environment variables for sub-processes.
+#
+mssql_export_ocf_exit_codes() {
+	export \
+        OCF_ERR_ARGS OCF_ERR_CONFIGURED OCF_ERR_GENERIC OCF_ERR_PERM OCF_ERR_UNIMPLEMENTED \
+        OCF_FAILED_MASTER OCF_NOT_RUNNING \
+        OCF_RUNNING_MASTER OCF_SUCCESS
+}
+
+# ----------------------------------------------------------------------------------------------------------
+#
+case $__OCF_ACTION in
+	meta-data)
+		mssql_meta_data
+		exit $OCF_SUCCESS
+		;;
+esac
+
+mssql_validate
+validate_result=$?
+
+ocf_log info "Resource agent invoked with: $__OCF_ACTION"
+
+# Everything else must pass validation
+if [[ $validate_result -ne 0 ]]; then
+	exit $validate_result
+fi
+
+mssql_export_ocf_exit_codes
+
+case $__OCF_ACTION in
+	start)
+		mssql_start
+		;;
+	stop)
+		mssql_stop
+		;;
+	monitor)
+		mssql_monitor
+		;;
+	promote)
+		mssql_promote
+		;;
+	demote)
+		mssql_demote
+		;;
+	notify)
+		mssql_notify
+		;;
+	validate-all)
+		exit $validate_result
+		;;
+	usage|help)
+		mssql_usage
+		exit $OCF_SUCCESS
+		;;
+	*)
+		mssql_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+
+ocf_log info "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
