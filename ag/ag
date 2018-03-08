@@ -117,12 +117,12 @@ mssql_start() {
 		$OCF_SUCCESS)
 			# Allow this replica to become a master
 			#
-			crm_master -v 10
+			crm_master -v 10 -N "$OCF_RESKEY_CRM_meta_on_node"
 			;;
 		$OCF_RUNNING_MASTER)
 			# This is already a primary. Set its master score higher than other replicas.
 			#
-			crm_master -v 20
+			crm_master -v 20 -N "$OCF_RESKEY_CRM_meta_on_node"
 			;;
 	esac
 
@@ -224,16 +224,16 @@ mssql_monitor() {
 		$OCF_SUCCESS)
 			# Allow this replica to become a master.
 			#
-			crm_master -v 10
+			crm_master -v 10 -N "$OCF_RESKEY_CRM_meta_on_node"
 			;;
 		$OCF_RUNNING_MASTER)
 			# This is a primary. Set its master score higher than other replicas.
 			#
-			crm_master -v 20
+			crm_master -v 20 -N "$OCF_RESKEY_CRM_meta_on_node"
 			;;
 		*)
 			# This replica is not healthy enough to be promoted to a master.
-			crm_master -v 0
+			crm_master -v 0 -N "$OCF_RESKEY_CRM_meta_on_node"
 			;;
 	esac
 
