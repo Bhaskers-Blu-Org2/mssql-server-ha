@@ -476,6 +476,10 @@ fi
 
 mssql_export_ocf_exit_codes
 
+# golang 1.6 fails at start if nproc > 256. Mitigation is to set GOMAXPROCS explicitly.
+# Ref https://github.com/golang/go/issues/15131
+export GOMAXPROCS="$(nproc)"
+
 case $__OCF_ACTION in
 	start)
 		mssql_start

@@ -117,12 +117,12 @@ mssql_start() {
 		$OCF_SUCCESS)
 			# Allow this replica to become a master
 			#
-			crm_master -v 10 -N "$OCF_RESKEY_CRM_meta_on_node"
+			crm_master -v 10 -l reboot
 			;;
 		$OCF_RUNNING_MASTER)
 			# This is already a primary. Set its master score higher than other replicas.
 			#
-			crm_master -v 20 -N "$OCF_RESKEY_CRM_meta_on_node"
+			crm_master -v 20 -l reboot
 			;;
 	esac
 
@@ -224,16 +224,16 @@ mssql_monitor() {
 		$OCF_SUCCESS)
 			# Allow this replica to become a master.
 			#
-			crm_master -v 10 -N "$OCF_RESKEY_CRM_meta_on_node"
+			crm_master -v 10 -l reboot
 			;;
 		$OCF_RUNNING_MASTER)
 			# This is a primary. Set its master score higher than other replicas.
 			#
-			crm_master -v 20 -N "$OCF_RESKEY_CRM_meta_on_node"
+			crm_master -v 20 -l reboot
 			;;
 		*)
 			# This replica is not healthy enough to be promoted to a master.
-			crm_master -v 0 -N "$OCF_RESKEY_CRM_meta_on_node"
+			crm_master -v 0 -l reboot
 			;;
 	esac
 
@@ -525,6 +525,10 @@ if [[ $validate_result -ne 0 ]]; then
 fi
 
 mssql_export_ocf_exit_codes
+
+# golang 1.6 fails at start if nproc > 256. Mitigation is to set GOMAXPROCS explicitly.
+# Ref https://github.com/golang/go/issues/15131
+export GOMAXPROCS="$(nproc)"
 
 case $__OCF_ACTION in
 	start)

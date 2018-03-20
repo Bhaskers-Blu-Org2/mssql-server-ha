@@ -560,7 +560,9 @@ func promote(
 			maxSequenceNumber = value
 		}
 
-		numSequenceNumbers++
+		if value > 0 {
+			numSequenceNumbers++
+		}
 	}
 
 	stdout.Printf("Max sequence number of all replicas of %s is %d\n", agName, maxSequenceNumber)
